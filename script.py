@@ -424,7 +424,8 @@ def main():
     print("  DISCREPANCY REPORT")
     print("=" * 72)
 
-    discrepancies = []
+    # Track which contracts have discrepancies + their balances
+    discrepancy_contracts = {}  # contract -> {symbol, expected, actual, diff}
 
     # ETH
     diff_eth = actual_eth - expected_eth
@@ -434,16 +435,10 @@ def main():
     print(f"  {'Difference':30s} {diff_eth:>28.18f}")
     if abs(diff_eth) > Decimal("0.000000000001"):
         print(f"  ** DISCREPANCY DETECTED **")
-        discrepancies.append({
-            "Token/Asset": "ETH",
-            "Contract Address": "",
-            "Expected Balance": f"{expected_eth:.18f}",
-            "Actual Balance": f"{actual_eth:.18f}",
-            "Difference": f"{diff_eth:.18f}",
-            "Total Inflows": f"{eth_in:.18f}",
-            "Total Outflows": f"{eth_out:.18f}",
-            "Total Gas Fees": f"{gas_total:.18f}",
-        })
+        discrepancy_contracts["ETH"] = {
+            "symbol": "ETH", "contract": "",
+            "expected": expected_eth, "actual": actual_eth, "diff": diff_eth,
+        }
     else:
         print(f"  OK")
 
@@ -465,31 +460,250 @@ def main():
         threshold = Decimal(1) / Decimal(10) ** min(tf["decimals"], 8)
         if abs(diff) > threshold:
             print(f"  ** DISCREPANCY DETECTED **")
-            discrepancies.append({
-                "Token/Asset": symbol,
-                "Contract Address": contract,
-                "Expected Balance": f"{expected}",
-                "Actual Balance": f"{actual}",
-                "Difference": f"{diff}",
-                "Total Inflows": f"{tf['in']}",
-                "Total Outflows": f"{tf['out']}",
-                "Total Gas Fees": "0",
-            })
+            discrepancy_contracts[contract] = {
+                "symbol": symbol, "contract": contract,
+                "expected": expected, "actual": actual, "diff": diff,
+            }
         else:
             print(f"  OK")
 
-    # ---- Write discrepancy CSV ----
-    if discrepancies:
+    # ---- Write discrepancy audit trail CSV ----
+    if discrepancy_contracts:
+        # Build token tx lookup: contract -> list of ERC20 transfer dicts
+        token_tx_lookup = defaultdict(list)
+        for tx in erc20_txs:
+            c = tx.get("contractAddress", "").lower()
+            if c in discrepancy_contracts:
+                token_tx_lookup[c].append(tx)
+
+        # Build normal tx lookup by hash for function names
+        normal_tx_by_hash = {}
+        for tx in normal_txs:
+            normal_tx_by_hash[tx["hash"].lower()] = tx
+
+        disc_rows = []
+        for key, info in sorted(discrepancy_contracts.items(), key=lambda x: x[1]["symbol"]):
+            symbol = info["symbol"]
+            contract = info["contract"]
+
+            # --- Summary row ---
+            disc_rows.append({
+                "Token/Asset": symbol,
+                "Contract Address": contract,
+                "Row Type": "SUMMARY",
+                "Date": "",
+                "Transaction Hash": "",
+                "Direction": "",
+                "From": "",
+                "To": "",
+                "Amount": "",
+                "Running Balance": "",
+                "Function Called": "",
+                "Expected Balance": f"{info['expected']}",
+                "Actual Balance": f"{info['actual']}",
+                "Difference": f"{info['diff']}",
+                "Resolution": "",
+            })
+
+            # --- Transaction tree for this token ---
+            if key == "ETH":
+                # For ETH, pull from the rows we already built
+                running = Decimal("0")
+                eth_txs_sorted = []
+                for tx in normal_txs:
+                    if tx.get("isError", "0") != "0":
+                        if tx["from"].lower() == WALLET:
+                            fee = Decimal(tx["gasUsed"]) * Decimal(tx["gasPrice"]) / Decimal("1e18")
+                            eth_txs_sorted.append({
+                                "ts": int(tx["timeStamp"]),
+                                "date": ts_to_date(tx["timeStamp"]),
+                                "hash": tx["hash"],
+                                "direction": "GAS (failed)",
+                                "from": tx["from"],
+                                "to": tx.get("to", ""),
+                                "amount": -fee,
+                                "fn": tx.get("functionName", ""),
+                            })
+                        continue
+                    value = wei_to_eth(tx["value"])
+                    from_addr = tx["from"].lower()
+                    to_addr = (tx.get("to") or "").lower()
+                    direction = "IN" if to_addr == WALLET else "OUT"
+                    fee = Decimal("0")
+                    if from_addr == WALLET:
+                        fee = Decimal(tx["gasUsed"]) * Decimal(tx["gasPrice"]) / Decimal("1e18")
+                    signed = value if direction == "IN" else -value
+                    fn = tx.get("functionName", "")
+                    eth_txs_sorted.append({
+                        "ts": int(tx["timeStamp"]),
+                        "date": ts_to_date(tx["timeStamp"]),
+                        "hash": tx["hash"],
+                        "direction": direction,
+                        "from": tx["from"],
+                        "to": tx.get("to", ""),
+                        "amount": signed,
+                        "fn": fn,
+                    })
+                    if fee > 0:
+                        eth_txs_sorted.append({
+                            "ts": int(tx["timeStamp"]),
+                            "date": ts_to_date(tx["timeStamp"]),
+                            "hash": tx["hash"],
+                            "direction": "GAS",
+                            "from": tx["from"],
+                            "to": "",
+                            "amount": -fee,
+                            "fn": fn,
+                        })
+                for tx in internal_txs:
+                    if tx.get("isError", "0") != "0":
+                        continue
+                    value = wei_to_eth(tx["value"])
+                    if value == 0:
+                        continue
+                    to_addr = (tx.get("to") or "").lower()
+                    direction = "IN" if to_addr == WALLET else "OUT"
+                    signed = value if direction == "IN" else -value
+                    eth_txs_sorted.append({
+                        "ts": int(tx["timeStamp"]),
+                        "date": ts_to_date(tx["timeStamp"]),
+                        "hash": tx.get("hash", tx.get("transactionHash", "")),
+                        "direction": f"{direction} (internal)",
+                        "from": tx["from"],
+                        "to": tx.get("to", ""),
+                        "amount": signed,
+                        "fn": "",
+                    })
+                eth_txs_sorted.sort(key=lambda x: x["ts"])
+                for t in eth_txs_sorted:
+                    running += t["amount"]
+                    disc_rows.append({
+                        "Token/Asset": "ETH",
+                        "Contract Address": "",
+                        "Row Type": "TX",
+                        "Date": t["date"],
+                        "Transaction Hash": t["hash"],
+                        "Direction": t["direction"],
+                        "From": t["from"],
+                        "To": t["to"],
+                        "Amount": f"{t['amount']:.18f}",
+                        "Running Balance": f"{running:.18f}",
+                        "Function Called": t["fn"],
+                        "Expected Balance": "",
+                        "Actual Balance": "",
+                        "Difference": "",
+                        "Resolution": "",
+                    })
+            else:
+                # ERC20 token tree
+                token_txs = token_tx_lookup.get(contract, [])
+                token_txs_sorted = sorted(token_txs, key=lambda x: int(x["timeStamp"]))
+                running = Decimal("0")
+                decimals_str = str(discrepancy_contracts[contract].get("decimals", 18))
+                for tf_entry in [token_flows.get(contract)]:
+                    if tf_entry:
+                        decimals_str = str(tf_entry["decimals"])
+
+                for tx in token_txs_sorted:
+                    value = token_amount(tx["value"], decimals_str)
+                    to_addr = (tx.get("to") or "").lower()
+                    direction = "IN" if to_addr == WALLET else "OUT"
+                    signed = value if direction == "IN" else -value
+                    running += signed
+
+                    # Look up the function from the normal tx
+                    ntx = normal_tx_by_hash.get(tx["hash"].lower(), {})
+                    fn = ntx.get("functionName", "")
+
+                    disc_rows.append({
+                        "Token/Asset": symbol,
+                        "Contract Address": contract,
+                        "Row Type": "TX",
+                        "Date": ts_to_date(tx["timeStamp"]),
+                        "Transaction Hash": tx["hash"],
+                        "Direction": direction,
+                        "From": tx["from"],
+                        "To": tx.get("to", ""),
+                        "Amount": f"{signed}",
+                        "Running Balance": f"{running}",
+                        "Function Called": fn,
+                        "Expected Balance": "",
+                        "Actual Balance": "",
+                        "Difference": "",
+                        "Resolution": "",
+                    })
+
+                # Final row showing the gap + auto-resolution
+                resolution = ""
+                if info["expected"] < 0 and info["actual"] >= 0:
+                    # More tokens went out than came in via Transfer events,
+                    # but actual balance is non-negative — the gap must be
+                    # non-transfer balance increases (rebasing, staking yield)
+                    resolution = (
+                        f"RESOLVED: {info['diff']} {symbol} from non-transfer "
+                        f"balance increase (rebasing/staking rewards). "
+                        f"Wallet received {abs(info['expected']):.9f} more via "
+                        f"rebase than tracked by Transfer events."
+                    )
+                elif info["expected"] > 0 and info["actual"] == 0:
+                    # Expected positive balance but actual is 0 — tokens
+                    # were likely burned, migrated, or are worthless/scam
+                    resolution = (
+                        f"RESOLVED: Token balance zeroed outside of Transfer "
+                        f"events. Likely a scam/airdrop token, admin burn, "
+                        f"or token migration."
+                    )
+                elif info["expected"] > 0 and info["actual"] > 0 and info["diff"] > 0:
+                    # Actual is higher than expected — extra tokens appeared
+                    resolution = (
+                        f"RESOLVED: +{info['diff']} {symbol} from non-transfer "
+                        f"balance increase (rebasing rewards, staking yield, "
+                        f"or direct contract mint)."
+                    )
+                elif info["expected"] > 0 and info["actual"] > 0 and info["diff"] < 0:
+                    # Actual is lower than expected — tokens disappeared
+                    # Typical of fee-on-transfer / reflection / tax tokens
+                    resolution = (
+                        f"RESOLVED: {info['diff']} {symbol} lost to fee-on-transfer "
+                        f"(tax token). Transfer events log pre-tax amounts but "
+                        f"wallet receives less due to built-in token tax."
+                    )
+
+                disc_rows.append({
+                    "Token/Asset": symbol,
+                    "Contract Address": contract,
+                    "Row Type": "GAP",
+                    "Date": "",
+                    "Transaction Hash": "",
+                    "Direction": "UNTRACKED",
+                    "From": "",
+                    "To": "",
+                    "Amount": f"{info['diff']}",
+                    "Running Balance": f"{info['actual']}",
+                    "Function Called": "Balance change not captured by Transfer events",
+                    "Expected Balance": "",
+                    "Actual Balance": "",
+                    "Difference": "",
+                    "Resolution": resolution,
+                })
+
+            # Empty separator row between tokens
+            disc_rows.append({k: "" for k in disc_rows[0]})
+
         disc_fields = [
-            "Token/Asset", "Contract Address",
+            "Token/Asset", "Contract Address", "Row Type",
+            "Date", "Transaction Hash", "Direction",
+            "From", "To", "Amount", "Running Balance",
+            "Function Called",
             "Expected Balance", "Actual Balance", "Difference",
-            "Total Inflows", "Total Outflows", "Total Gas Fees",
+            "Resolution",
         ]
         with open(DISCREPANCY_FILE, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=disc_fields)
             writer.writeheader()
-            writer.writerows(discrepancies)
-        print(f"\n[+] Wrote {len(discrepancies)} discrepancies to {DISCREPANCY_FILE}")
+            writer.writerows(disc_rows)
+        print(f"\n[+] Wrote {len(discrepancy_contracts)} token audit trails "
+              f"({len(disc_rows)} rows) to {DISCREPANCY_FILE}")
     else:
         print(f"\n[+] No discrepancies found — no {DISCREPANCY_FILE} written.")
 
