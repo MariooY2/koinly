@@ -18,6 +18,10 @@ from urllib.error import URLError, HTTPError
 from collections import defaultdict
 import os
 
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side, numbers
+from openpyxl.utils import get_column_letter
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -37,13 +41,18 @@ def _load_env(path=".env"):
 _load_env()
 
 ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY", "")
+ALCHEMY_API_KEY = os.environ.get("ALCHEMY_API_KEY", "")
 WALLET = os.environ.get("WALLET_ADDRESS", "").lower()
-CSV_FILE = "transactions.csv"
-DISCREPANCY_FILE = "discrepancies.csv"
+TRANSACTIONS_DIR = "transactions"
+DISCREPANCIES_DIR = "discrepancies"
+CSV_FILE = os.path.join(TRANSACTIONS_DIR, "transactions.csv")
+DISCREPANCY_FILE = os.path.join(DISCREPANCIES_DIR, "discrepancies.csv")
 BASE_URL = "https://api.etherscan.io/v2/api"
+ALCHEMY_URL = f"https://eth-mainnet.g.alchemy.com/v2/{ALCHEMY_API_KEY}"
 CHAIN_ID = "1"                                  # 1 = Ethereum mainnet
 PAGE_SIZE = 10000                               # max rows per API page
 RATE_LIMIT_DELAY = 0.22                         # ~5 req/s for free tier
+BALANCE_OF_SELECTOR = "0x70a08231"              # balanceOf(address)
 
 getcontext().prec = 36                          # enough for 18-decimal tokens
 
@@ -113,6 +122,32 @@ def ts_to_date(ts: str) -> str:
     return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime(
         "%Y-%m-%d %H:%M:%S UTC"
     )
+
+
+def alchemy_balance_of(contract: str, block: int, decimals: int) -> Decimal:
+    """Call balanceOf(wallet) on a token contract at a specific block via Alchemy."""
+    if not ALCHEMY_API_KEY:
+        return Decimal("-1")  # sentinel: Alchemy not configured
+    addr = WALLET.replace("0x", "").lower().zfill(64)
+    calldata = BALANCE_OF_SELECTOR + addr
+    payload = json.dumps({
+        "jsonrpc": "2.0", "id": 1,
+        "method": "eth_call",
+        "params": [{"to": contract, "data": calldata}, hex(block)],
+    }).encode()
+    try:
+        req = Request(ALCHEMY_URL, data=payload, headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0",
+        })
+        with urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+        hex_result = data.get("result", "0x0")
+        if hex_result in (None, "0x", "0x0", ""):
+            return Decimal("0")
+        return Decimal(int(hex_result, 16)) / Decimal(10) ** decimals
+    except (URLError, HTTPError, ValueError):
+        return Decimal("-1")
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +220,7 @@ def process_normal(txs: list) -> list:
                 gas_total += fee
                 rows.append({
                     "Date": ts_to_date(tx["timeStamp"]),
+                    "Block Number": tx.get("blockNumber", ""),
                     "Transaction Hash": tx["hash"],
                     "Type": "OUT (failed)",
                     "From": tx["from"],
@@ -215,6 +251,7 @@ def process_normal(txs: list) -> list:
 
         rows.append({
             "Date": ts_to_date(tx["timeStamp"]),
+            "Block Number": tx.get("blockNumber", ""),
             "Transaction Hash": tx["hash"],
             "Type": direction,
             "From": tx["from"],
@@ -251,6 +288,7 @@ def process_internal(txs: list) -> list:
 
         rows.append({
             "Date": ts_to_date(tx["timeStamp"]),
+            "Block Number": tx.get("blockNumber", ""),
             "Transaction Hash": tx.get("hash", tx.get("transactionHash", "")),
             "Type": f"{direction} (internal)",
             "From": tx["from"],
@@ -304,6 +342,7 @@ def process_erc20(txs: list) -> list:
 
         rows.append({
             "Date": ts_to_date(tx["timeStamp"]),
+            "Block Number": tx.get("blockNumber", ""),
             "Transaction Hash": tx["hash"],
             "Type": direction,
             "From": tx["from"],
@@ -375,13 +414,15 @@ def main():
             sys.stdout.buffer, encoding="utf-8", errors="replace"
         )
 
+    os.makedirs(TRANSACTIONS_DIR, exist_ok=True)
+    os.makedirs(DISCREPANCIES_DIR, exist_ok=True)
+
     if not ETHERSCAN_API_KEY:
         print("[!] ERROR: ETHERSCAN_API_KEY is empty. Set it in .env")
         return
     if not WALLET:
         print("[!] ERROR: WALLET_ADDRESS is empty. Set it in .env")
         return
-    print(f"[*] API key: {ETHERSCAN_API_KEY[:6]}…{ETHERSCAN_API_KEY[-4:]}")
     print(f"[*] Wallet:  {WALLET}")
 
     # ---- Fetch all transactions ----
@@ -403,7 +444,7 @@ def main():
 
     # ---- Write CSV ----
     fieldnames = [
-        "Date", "Transaction Hash", "Type", "From", "To",
+        "Date", "Block Number", "Transaction Hash", "Type", "From", "To",
         "Amount", "Token/Asset", "Gas Fee (in ETH)",
         "Function", "Input Data",
     ]
@@ -492,12 +533,14 @@ def main():
                 "Contract Address": contract,
                 "Row Type": "SUMMARY",
                 "Date": "",
+                "Block Number": "",
                 "Transaction Hash": "",
                 "Direction": "",
                 "From": "",
                 "To": "",
                 "Amount": "",
                 "Running Balance": "",
+                "On-Chain Balance": "",
                 "Function Called": "",
                 "Expected Balance": f"{info['expected']}",
                 "Actual Balance": f"{info['actual']}",
@@ -516,6 +559,7 @@ def main():
                             fee = Decimal(tx["gasUsed"]) * Decimal(tx["gasPrice"]) / Decimal("1e18")
                             eth_txs_sorted.append({
                                 "ts": int(tx["timeStamp"]),
+                                "block": tx.get("blockNumber", ""),
                                 "date": ts_to_date(tx["timeStamp"]),
                                 "hash": tx["hash"],
                                 "direction": "GAS (failed)",
@@ -536,6 +580,7 @@ def main():
                     fn = tx.get("functionName", "")
                     eth_txs_sorted.append({
                         "ts": int(tx["timeStamp"]),
+                        "block": tx.get("blockNumber", ""),
                         "date": ts_to_date(tx["timeStamp"]),
                         "hash": tx["hash"],
                         "direction": direction,
@@ -547,6 +592,7 @@ def main():
                     if fee > 0:
                         eth_txs_sorted.append({
                             "ts": int(tx["timeStamp"]),
+                            "block": tx.get("blockNumber", ""),
                             "date": ts_to_date(tx["timeStamp"]),
                             "hash": tx["hash"],
                             "direction": "GAS",
@@ -566,6 +612,7 @@ def main():
                     signed = value if direction == "IN" else -value
                     eth_txs_sorted.append({
                         "ts": int(tx["timeStamp"]),
+                        "block": tx.get("blockNumber", ""),
                         "date": ts_to_date(tx["timeStamp"]),
                         "hash": tx.get("hash", tx.get("transactionHash", "")),
                         "direction": f"{direction} (internal)",
@@ -582,12 +629,14 @@ def main():
                         "Contract Address": "",
                         "Row Type": "TX",
                         "Date": t["date"],
+                        "Block Number": t["block"],
                         "Transaction Hash": t["hash"],
                         "Direction": t["direction"],
                         "From": t["from"],
                         "To": t["to"],
                         "Amount": f"{t['amount']:.18f}",
                         "Running Balance": f"{running:.18f}",
+                        "On-Chain Balance": "",
                         "Function Called": t["fn"],
                         "Expected Balance": "",
                         "Actual Balance": "",
@@ -599,10 +648,17 @@ def main():
                 token_txs = token_tx_lookup.get(contract, [])
                 token_txs_sorted = sorted(token_txs, key=lambda x: int(x["timeStamp"]))
                 running = Decimal("0")
-                decimals_str = str(discrepancy_contracts[contract].get("decimals", 18))
-                for tf_entry in [token_flows.get(contract)]:
-                    if tf_entry:
-                        decimals_str = str(tf_entry["decimals"])
+                tok_decimals = 18
+                tf_entry = token_flows.get(contract)
+                if tf_entry:
+                    tok_decimals = tf_entry["decimals"]
+                decimals_str = str(tok_decimals)
+
+                if ALCHEMY_API_KEY:
+                    print(f"  [*] Querying on-chain balance history for {symbol} ({len(token_txs_sorted)} blocks) …")
+
+                bal_before = Decimal("-1")
+                bal_after = Decimal("-1")
 
                 for tx in token_txs_sorted:
                     value = token_amount(tx["value"], decimals_str)
@@ -615,17 +671,29 @@ def main():
                     ntx = normal_tx_by_hash.get(tx["hash"].lower(), {})
                     fn = ntx.get("functionName", "")
 
+                    # Query on-chain balance via Alchemy at both block-1 and block
+                    block_num = tx.get("blockNumber", "")
+                    onchain_bal = ""
+                    if ALCHEMY_API_KEY and block_num:
+                        bn = int(block_num)
+                        bal_before = alchemy_balance_of(contract, bn - 1, tok_decimals)
+                        bal_after = alchemy_balance_of(contract, bn, tok_decimals)
+                        if bal_before >= 0 and bal_after >= 0:
+                            onchain_bal = f"(N-1) {bal_before}  (N) {bal_after}"
+
                     disc_rows.append({
                         "Token/Asset": symbol,
                         "Contract Address": contract,
                         "Row Type": "TX",
                         "Date": ts_to_date(tx["timeStamp"]),
+                        "Block Number": block_num,
                         "Transaction Hash": tx["hash"],
                         "Direction": direction,
                         "From": tx["from"],
                         "To": tx.get("to", ""),
                         "Amount": f"{signed}",
                         "Running Balance": f"{running}",
+                        "On-Chain Balance": onchain_bal,
                         "Function Called": fn,
                         "Expected Balance": "",
                         "Actual Balance": "",
@@ -663,10 +731,19 @@ def main():
                 elif info["expected"] > 0 and info["actual"] > 0 and info["diff"] < 0:
                     # Actual is lower than expected — tokens disappeared
                     # Typical of fee-on-transfer / reflection / tax tokens
+                    # Calculate tax from last OUT tx: (N-1) - transfer_amount - (N)
+                    tax_detail = ""
+                    if ALCHEMY_API_KEY and direction == "OUT" and bal_before >= 0 and bal_after >= 0:
+                        transfer_amt = abs(signed)
+                        tax_taken = bal_before - transfer_amt - bal_after
+                        tax_detail = (
+                            f" Last sell tax: On-Chain(N-1) {bal_before} "
+                            f"- Transfer {transfer_amt} "
+                            f"- On-Chain(N) {bal_after} "
+                            f"= {tax_taken} {symbol} taken by contract."
+                        )
                     resolution = (
-                        f"RESOLVED: {info['diff']} {symbol} lost to fee-on-transfer "
-                        f"(tax token). Transfer events log pre-tax amounts but "
-                        f"wallet receives less due to built-in token tax."
+                        f"RESOLVED: fee-on-transfer (tax token).{tax_detail}"
                     )
 
                 disc_rows.append({
@@ -674,12 +751,14 @@ def main():
                     "Contract Address": contract,
                     "Row Type": "GAP",
                     "Date": "",
+                    "Block Number": "",
                     "Transaction Hash": "",
                     "Direction": "UNTRACKED",
                     "From": "",
                     "To": "",
                     "Amount": f"{info['diff']}",
                     "Running Balance": f"{info['actual']}",
+                    "On-Chain Balance": f"{info['actual']}",
                     "Function Called": "Balance change not captured by Transfer events",
                     "Expected Balance": "",
                     "Actual Balance": "",
@@ -692,9 +771,9 @@ def main():
 
         disc_fields = [
             "Token/Asset", "Contract Address", "Row Type",
-            "Date", "Transaction Hash", "Direction",
+            "Date", "Block Number", "Transaction Hash", "Direction",
             "From", "To", "Amount", "Running Balance",
-            "Function Called",
+            "On-Chain Balance", "Function Called",
             "Expected Balance", "Actual Balance", "Difference",
             "Resolution",
         ]
@@ -707,9 +786,188 @@ def main():
     else:
         print(f"\n[+] No discrepancies found — no {DISCREPANCY_FILE} written.")
 
+    # ---- Export to styled Excel ----
+    print("\n[*] Generating styled Excel files …")
+    _write_transactions_xlsx(rows, fieldnames)
+    if discrepancy_contracts:
+        _write_discrepancies_xlsx(disc_rows, disc_fields)
+
     print("\n" + "=" * 72)
     print("  Done.")
     print("=" * 72)
+
+
+# ---------------------------------------------------------------------------
+# Excel export helpers
+# ---------------------------------------------------------------------------
+
+# Shared styles
+_HEADER_FONT = Font(bold=True, color="FFFFFF", size=11)
+_HEADER_FILL = PatternFill(start_color="2F5496", end_color="2F5496", fill_type="solid")
+_HEADER_ALIGN = Alignment(horizontal="center", vertical="center", wrap_text=True)
+_THIN_BORDER = Border(
+    left=Side(style="thin", color="D9D9D9"),
+    right=Side(style="thin", color="D9D9D9"),
+    top=Side(style="thin", color="D9D9D9"),
+    bottom=Side(style="thin", color="D9D9D9"),
+)
+_IN_FILL = PatternFill(start_color="E2EFDA", end_color="E2EFDA", fill_type="solid")
+_OUT_FILL = PatternFill(start_color="FCE4EC", end_color="FCE4EC", fill_type="solid")
+_FAILED_FILL = PatternFill(start_color="F2F2F2", end_color="F2F2F2", fill_type="solid")
+_SUMMARY_FILL = PatternFill(start_color="D6E4F0", end_color="D6E4F0", fill_type="solid")
+_SUMMARY_FONT = Font(bold=True, size=11)
+_GAP_FILL = PatternFill(start_color="FFF2CC", end_color="FFF2CC", fill_type="solid")
+_GAP_FONT = Font(bold=True, color="BF8F00", size=11)
+_RESOLVED_FONT = Font(bold=True, color="548235", size=11)
+_ZEBRA_FILL = PatternFill(start_color="F5F5F5", end_color="F5F5F5", fill_type="solid")
+
+
+def _style_header(ws, num_cols):
+    """Apply header styling to first row."""
+    for col in range(1, num_cols + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.font = _HEADER_FONT
+        cell.fill = _HEADER_FILL
+        cell.alignment = _HEADER_ALIGN
+        cell.border = _THIN_BORDER
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
+
+
+def _auto_width(ws, num_cols, max_width=50):
+    """Auto-fit column widths based on content."""
+    for col in range(1, num_cols + 1):
+        max_len = 0
+        col_letter = get_column_letter(col)
+        for row in ws.iter_rows(min_col=col, max_col=col, values_only=False):
+            for cell in row:
+                if cell.value:
+                    max_len = max(max_len, len(str(cell.value)))
+        ws.column_dimensions[col_letter].width = min(max_len + 3, max_width)
+
+
+def _write_transactions_xlsx(rows, fieldnames):
+    """Write transactions to a styled .xlsx file."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Transactions"
+
+    # Header
+    ws.append(fieldnames)
+    _style_header(ws, len(fieldnames))
+
+    # Find column indices
+    amount_col = fieldnames.index("Amount") + 1
+    gas_col = fieldnames.index("Gas Fee (in ETH)") + 1
+
+    # Data rows
+    for i, row in enumerate(rows, start=2):
+        values = [row.get(f, "") for f in fieldnames]
+        ws.append(values)
+
+        tx_type = row.get("Type", "")
+
+        # Row coloring by direction
+        if "IN" in tx_type and "failed" not in tx_type:
+            fill = _IN_FILL
+        elif "OUT" in tx_type and "failed" not in tx_type:
+            fill = _OUT_FILL
+        elif "failed" in tx_type:
+            fill = _FAILED_FILL
+        elif i % 2 == 0:
+            fill = _ZEBRA_FILL
+        else:
+            fill = None
+
+        for col in range(1, len(fieldnames) + 1):
+            cell = ws.cell(row=i, column=col)
+            cell.border = _THIN_BORDER
+            if fill:
+                cell.fill = fill
+
+        # Right-align numeric columns
+        ws.cell(row=i, column=amount_col).alignment = Alignment(horizontal="right")
+        ws.cell(row=i, column=gas_col).alignment = Alignment(horizontal="right")
+
+    _auto_width(ws, len(fieldnames))
+
+    # Wrap text in Input Data column
+    input_col = fieldnames.index("Input Data") + 1
+    for row_idx in range(2, len(rows) + 2):
+        cell = ws.cell(row=row_idx, column=input_col)
+        cell.alignment = Alignment(wrap_text=True)
+
+    out_path = CSV_FILE.replace(".csv", ".xlsx")
+    wb.save(out_path)
+    print(f"[+] Wrote {len(rows)} rows to {out_path}")
+
+
+def _write_discrepancies_xlsx(disc_rows, disc_fields):
+    """Write discrepancy audit trail to a styled .xlsx file."""
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Discrepancy Audit"
+
+    # Header
+    ws.append(disc_fields)
+    _style_header(ws, len(disc_fields))
+
+    # Find column indices
+    amount_col = disc_fields.index("Amount") + 1
+    running_col = disc_fields.index("Running Balance") + 1
+    onchain_col = disc_fields.index("On-Chain Balance") + 1
+    resolution_col = disc_fields.index("Resolution") + 1
+
+    for i, row in enumerate(disc_rows, start=2):
+        values = [row.get(f, "") for f in disc_fields]
+        ws.append(values)
+
+        row_type = row.get("Row Type", "")
+        direction = row.get("Direction", "")
+
+        # Row styling based on type
+        if row_type == "SUMMARY":
+            for col in range(1, len(disc_fields) + 1):
+                cell = ws.cell(row=i, column=col)
+                cell.fill = _SUMMARY_FILL
+                cell.font = _SUMMARY_FONT
+                cell.border = _THIN_BORDER
+        elif row_type == "GAP":
+            for col in range(1, len(disc_fields) + 1):
+                cell = ws.cell(row=i, column=col)
+                cell.fill = _GAP_FILL
+                cell.font = _GAP_FONT
+                cell.border = _THIN_BORDER
+            # Resolution column in green
+            res_cell = ws.cell(row=i, column=resolution_col)
+            if res_cell.value and str(res_cell.value).startswith("RESOLVED"):
+                res_cell.font = _RESOLVED_FONT
+        elif row_type == "TX":
+            if "IN" in direction:
+                fill = _IN_FILL
+            elif "OUT" in direction:
+                fill = _OUT_FILL
+            else:
+                fill = None
+            for col in range(1, len(disc_fields) + 1):
+                cell = ws.cell(row=i, column=col)
+                cell.border = _THIN_BORDER
+                if fill:
+                    cell.fill = fill
+        else:
+            # Separator row — leave blank/light
+            for col in range(1, len(disc_fields) + 1):
+                ws.cell(row=i, column=col).border = _THIN_BORDER
+
+        # Right-align numeric columns
+        for col_idx in (amount_col, running_col, onchain_col):
+            ws.cell(row=i, column=col_idx).alignment = Alignment(horizontal="right")
+
+    _auto_width(ws, len(disc_fields))
+
+    out_path = DISCREPANCY_FILE.replace(".csv", ".xlsx")
+    wb.save(out_path)
+    print(f"[+] Wrote {len(disc_rows)} rows to {out_path}")
 
 
 if __name__ == "__main__":
